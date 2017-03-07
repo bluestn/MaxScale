@@ -32,9 +32,10 @@
 
 #include <maxscale/cppdefs.hh>
 
+#include <stdio.h>
 #include <string>
 #include <string.h>
-#include <stdio.h>
+#include <vector>
 
 #include <maxscale/alloc.h>
 #include <maxscale/filter.h>
@@ -49,6 +50,10 @@ using std::string;
 
 class RegexHintInst;
 struct RegexHintSess_t;
+struct RegexToServers;
+
+typedef std::vector<string> StringArray;
+typedef std::vector<RegexToServers> MappingArray;
 
 typedef struct source_host
 {
@@ -63,12 +68,10 @@ typedef struct source_host
 class RegexHintInst : public MXS_FILTER
 {
 private:
-    string m_match; /* Regular expression to match */
-    string m_server; /* Server to route to */
     string m_user; /* User name to restrict matches */
-
     REGEXHINT_SOURCE_HOST *m_source; /* Source address to restrict matches */
-    pcre2_code* m_regex; /* Compiled regex text, can be used from multiple threads */
+    MappingArray m_mapping; /* Regular expression to serverlist mapping */
+    int m_ovector_size; /* Given to pcre2_match_data_create() */
 
     /* Total statements diverted statistics. Unreliable due to non-locked but
      * shared access. */
@@ -78,12 +81,14 @@ private:
     int check_source_host(const char *remote, const struct sockaddr_in *ipv4);
 
 public:
-    RegexHintInst(string match, string server, string user, REGEXHINT_SOURCE_HOST* source,
-                  pcre2_code* regex);
+    RegexHintInst(string user, REGEXHINT_SOURCE_HOST* source, MappingArray& map,
+                  int ovector_size);
     ~RegexHintInst();
     RegexHintSess_t* newSession(MXS_SESSION *session);
     int routeQuery(RegexHintSess_t* session, GWBUF *queue);
     void diagnostic(RegexHintSess_t* session, DCB *dcb);
+    int find_servers(RegexHintSess_t* my_session, StringArray& servers, char* sql,
+                     int sql_len);
 };
 
 /**
@@ -99,12 +104,29 @@ typedef struct RegexHintSess_t
     bool regex_error_printed;
 } RegexHintSess;
 
+/* Storage class which maps a regex to a set of servers. Note that this struct
+ * does not manage the regex memory, which is done by the filter instance. */
+struct RegexToServers
+{
+    string m_match; /* Regex in text form */
+    pcre2_code* m_regex; /* Compiled regex */
+    StringArray m_servers; /* List of target servers. */
+
+    RegexToServers(string match, pcre2_code* regex)
+        : m_match(match),
+          m_regex(regex)
+    {}
+
+    int add_servers(string server_names);
+};
+
 /* Api entrypoints */
 static MXS_FILTER *createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params);
 static MXS_FILTER_SESSION *newSession(MXS_FILTER *instance, MXS_SESSION *session);
 static void closeSession(MXS_FILTER *instance, MXS_FILTER_SESSION *session);
 static void freeSession(MXS_FILTER *instance, MXS_FILTER_SESSION *session);
-static void setDownstream(MXS_FILTER *instance, MXS_FILTER_SESSION *fsession, MXS_DOWNSTREAM *downstream);
+static void setDownstream(MXS_FILTER *instance, MXS_FILTER_SESSION *fsession,
+                          MXS_DOWNSTREAM *downstream);
 static int routeQuery(MXS_FILTER *instance, MXS_FILTER_SESSION *fsession, GWBUF *queue);
 static void diagnostic(MXS_FILTER *instance, MXS_FILTER_SESSION *fsession, DCB *dcb);
 static uint64_t getCapabilities(MXS_FILTER* instance);
@@ -113,6 +135,13 @@ static uint64_t getCapabilities(MXS_FILTER* instance);
 static bool validate_ip_address(const char *);
 static REGEXHINT_SOURCE_HOST *set_source_address(const char *);
 static void free_instance(RegexHintInst *);
+static void generate_param_names(int pairs);
+static void form_regex_server_mapping(MappingArray& mapping, int pcre_ops,
+                                      MXS_CONFIG_PARAMETER* params);
+
+/* These arrays contain the possible config parameter names. */
+static StringArray param_names_match;
+static StringArray param_names_server;
 
 static const MXS_ENUM_VALUE option_values[] =
 {
@@ -122,20 +151,47 @@ static const MXS_ENUM_VALUE option_values[] =
     {NULL}
 };
 
-RegexHintInst::RegexHintInst(string match, string server, string user,
-                             REGEXHINT_SOURCE_HOST* source, pcre2_code* regex)
-    :   m_match(match),
-        m_server(server),
-        m_user(user),
+int RegexToServers::add_servers(string server_names)
+{
+    /* Parse the list, server names separated by ','. Do as in config.c :
+     * configure_new_service() to stay compatible. We cannot check here
+     * (at least not easily) if the server is named correctly, since the
+     * filter doesn't even know its service. */
+    char *pzServers;
+    int found = 0;
+    if ((pzServers = MXS_STRDUP_A(server_names.c_str())) == NULL)
+    {
+        return -1;
+    }
+    char *lasts;
+    char *s = strtok_r(pzServers, ",", &lasts);
+    while (s)
+    {
+        m_servers.push_back(s);
+        found++;
+        s = strtok_r(NULL, ",", &lasts);
+    }
+    MXS_FREE(pzServers);
+    return found;
+}
+
+RegexHintInst::RegexHintInst(string user, REGEXHINT_SOURCE_HOST* source,
+                             MappingArray& mapping, int ovector_size)
+    :   m_user(user),
         m_source(source),
-        m_regex(regex),
+        m_mapping(mapping),
+        m_ovector_size(ovector_size),
         m_total_diverted(0),
         m_total_undiverted(0)
 {}
+
 RegexHintInst::~RegexHintInst()
 {
-    pcre2_code_free(m_regex);
     MXS_FREE(m_source);
+    for (unsigned int i = 0; i < m_mapping.size(); i++)
+    {
+        pcre2_code_free(m_mapping.at(i).m_regex);
+    }
 }
 
 RegexHintSess_t* RegexHintInst::newSession(MXS_SESSION *session)
@@ -151,7 +207,7 @@ RegexHintSess_t* RegexHintInst::newSession(MXS_SESSION *session)
         my_session->active = 1;
         /* It's best to generate match data from the pattern to avoid extra allocations
          * during matching. If data creation fails, matching will fail as well. */
-        my_session->match_data = pcre2_match_data_create_from_pattern(m_regex, NULL);
+        my_session->match_data = pcre2_match_data_create(m_ovector_size, NULL);
 
         /* Check client IP against 'source' host option */
         if (m_source && m_source->address &&
@@ -172,6 +228,35 @@ RegexHintSess_t* RegexHintInst::newSession(MXS_SESSION *session)
     return my_session;
 }
 
+int RegexHintInst::find_servers(RegexHintSess_t* my_session, StringArray& servers,
+                                char* sql, int sql_len)
+{
+    /* Go through the regex array and find a match. Return the first match. */
+    for (unsigned int i = 0; i < this->m_mapping.size(); i++)
+    {
+        pcre2_code* regex = this->m_mapping[i].m_regex;
+        int result = pcre2_match(regex, (PCRE2_SPTR)sql, sql_len, 0, 0,
+                                 my_session->match_data, NULL);
+        if (result >= 0)
+        {
+            /* Have a match. No need to check if the regex matches the complete
+             * query, since the user can form the regex to enforce this. */
+            servers = this->m_mapping[i].m_servers;
+            return result;
+        }
+        else if (result == PCRE2_ERROR_NOMATCH)
+        {
+            continue;
+        }
+        else
+        {
+            /* Error during matching */
+            return result;
+        }
+    }
+    return PCRE2_ERROR_NOMATCH;
+}
+
 int RegexHintInst::routeQuery(RegexHintSess_t* my_session, GWBUF *queue)
 {
     char *sql = NULL;
@@ -181,15 +266,18 @@ int RegexHintInst::routeQuery(RegexHintSess_t* my_session, GWBUF *queue)
     {
         if (modutil_extract_SQL(queue, &sql, &sql_len))
         {
-            int result = pcre2_match(m_regex, (PCRE2_SPTR)sql, sql_len, 0, 0,
-                                     my_session->match_data, NULL);
+            StringArray servers;
+            int result = find_servers(my_session, servers, sql, sql_len);
+
             if (result >= 0)
             {
-                /* Have a match. No need to check if the regex matches the complete
-                 * query, since the user can form the regex to enforce this. */
-                queue->hint =
-                    hint_create_route(queue->hint, HINT_ROUTE_TO_NAMED_SERVER,
-                                      m_server.c_str());
+                /* Add the servers in the list to the buffer routing hints */
+                for (unsigned int i = 0; i < servers.size(); i++)
+                {
+                    queue->hint =
+                        hint_create_route(queue->hint, HINT_ROUTE_TO_NAMED_SERVER,
+                                          servers[i].c_str());
+                }
                 my_session->n_diverted++;
                 m_total_diverted++;
             }
@@ -198,14 +286,14 @@ int RegexHintInst::routeQuery(RegexHintSess_t* my_session, GWBUF *queue)
                 my_session->n_undiverted++;
                 m_total_undiverted++;
             }
-            else if (result < 0)
+            else
             {
                 // Print regex error only once per session
                 if (!my_session->regex_error_printed)
                 {
                     MXS_PCRE2_PRINT_ERROR(result);
+                    my_session->regex_error_printed = true;
                 }
-                my_session->regex_error_printed = true;
                 my_session->n_undiverted++;
                 m_total_undiverted++;
             }
@@ -217,8 +305,21 @@ int RegexHintInst::routeQuery(RegexHintSess_t* my_session, GWBUF *queue)
 
 void RegexHintInst::diagnostic(RegexHintSess_t* my_session, DCB *dcb)
 {
-    dcb_printf(dcb, "\t\tMatch and route:           /%s/ -> %s\n",
-               m_match.c_str(), m_server.c_str());
+    if (this->m_mapping.size() > 0)
+    {
+        dcb_printf(dcb, "\t\tMatches and routes:\n");
+    }
+    for (unsigned int i = 0; i < this->m_mapping.size(); i++)
+    {
+        dcb_printf(dcb, "\t\t\t/%s/ -> ",
+                   this->m_mapping[i].m_match.c_str());
+        dcb_printf(dcb, "%s", this->m_mapping[i].m_servers[0].c_str());
+        for (unsigned int j = 1; j < m_mapping[i].m_servers.size(); j++)
+        {
+            dcb_printf(dcb, ", %s", m_mapping[i].m_servers[j].c_str());
+        }
+        dcb_printf(dcb, "\n");
+    }
     dcb_printf(dcb, "\t\tTotal no. of queries diverted by filter (approx.):     %d\n",
                m_total_diverted);
     dcb_printf(dcb, "\t\tTotal no. of queries not diverted by filter (approx.): %d\n",
@@ -310,10 +411,9 @@ static MXS_FILTER*
 createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
 {
     bool error = false;
-
     REGEXHINT_SOURCE_HOST* source = NULL;
     /* The cfg_param cannot be changed to string because set_source_address doesn't
-       copy the contents. */
+       copy the contents. This inefficient as the config string searching */
     const char *cfg_param = config_get_string(params, "source");
     if (*cfg_param)
     {
@@ -325,56 +425,26 @@ createInstance(const char *name, char **options, MXS_CONFIG_PARAMETER *params)
         }
     }
 
-    string match(config_get_string(params, "match"));
-    string server(config_get_string(params, "server"));
-    string user(config_get_string(params, "user"));
-
     int pcre_ops = config_get_enum(params, "options", option_values);
-    int errorcode = -1;
-    PCRE2_SIZE error_offset = -1;
-    pcre2_code* regex =
-        pcre2_compile((PCRE2_SPTR) match.c_str(), match.length(), pcre_ops,
-                      &errorcode, &error_offset, NULL);
-    if (regex)
-    {
-        // Try to compile even further for faster matching
-        if (pcre2_jit_compile(regex, PCRE2_JIT_COMPLETE) < 0)
-        {
-            MXS_NOTICE("PCRE2 JIT compilation of pattern '%s' failed, "
-                       "falling back to normal compilation.", match.c_str());
-        }
-    }
-    else
-    {
-        error = true;
-        MXS_ERROR("Invalid PCRE2 regular expression '%s' (position '%zu').",
-                  match.c_str(), error_offset);
-        MXS_PCRE2_PRINT_ERROR(errorcode);
-    }
+    MappingArray mapping;
+    form_regex_server_mapping(mapping, pcre_ops, params);
 
-    if (error)
+    if (!mapping.size() || error)
     {
-        if (source)
-        {
-            MXS_FREE(source);
-        }
-        if (regex)
-        {
-            pcre2_code_free(regex);
-        }
+        MXS_FREE(source);
         return NULL;
     }
     else
     {
         RegexHintInst* instance = NULL;
+        string user(config_get_string(params, "user"));
+        int ovec_size = config_get_integer(params, "ovector_size");
+
         MXS_EXCEPTION_GUARD(instance =
-                                new RegexHintInst(match, server, user, source, regex));
+                                new RegexHintInst(user, source, mapping, ovec_size));
         return instance;
     }
-
 }
-
-
 
 /**
  * Associate a new session with this instance of the filter.
@@ -484,6 +554,98 @@ diagnostic(MXS_FILTER *instance, MXS_FILTER_SESSION *fsession, DCB *dcb)
 static uint64_t getCapabilities(MXS_FILTER* instance)
 {
     return RCAP_TYPE_CONTIGUOUS_INPUT;
+}
+
+/**
+ * Free allocated memory
+ *
+ * @param instance    The filter instance
+ */
+static void free_instance(MXS_FILTER* instance)
+{
+    RegexHintInst *my_instance = static_cast<RegexHintInst*>(instance);
+    MXS_EXCEPTION_GUARD(delete my_instance);
+}
+
+/**
+ * Read all regexes from the supplied configuration, compile them and form the mapping
+ *
+ * @param mapping An array of regex->serverList mappings for filling in. Is cleared on error.
+ * @param pcre_ops options for pcre2_compile
+ * @param params config parameters
+ */
+static void form_regex_server_mapping(MappingArray& mapping, int pcre_ops, MXS_CONFIG_PARAMETER* params)
+{
+    ss_dassert(param_names_match.size() == param_names_server.size());
+    bool error = false;
+    /* The config parameters can be in any order and may be skipping numbers.
+     * Must just search for every possibility. Quite inefficient, but this is
+     * only done once. */
+    for (unsigned int i = 0; i < param_names_match.size(); i++)
+    {
+        const char* zMatch = param_names_match.at(i).c_str();
+        const char* zServer = param_names_server.at(i).c_str();
+        string match(config_get_string(params, zMatch));
+        string servers(config_get_string(params, zServer));
+
+        /* Check that both the regex and server config parameters are found */
+        if (match.length() < 1 || servers.length() < 1)
+        {
+            if (match.length() > 0)
+            {
+                MXS_NOTICE("No server defined for regex setting '%s', skipping.", zMatch);
+            }
+            else if (servers.length() > 0)
+            {
+                MXS_NOTICE("No regex defined for server setting '%s', skipping.", zServer);
+            }
+            continue;
+        }
+
+        int errorcode = -1;
+        PCRE2_SIZE error_offset = -1;
+        pcre2_code* regex =
+            pcre2_compile((PCRE2_SPTR) match.c_str(), match.length(), pcre_ops,
+                          &errorcode, &error_offset, NULL);
+
+        if (regex)
+        {
+            // Try to compile even further for faster matching
+            if (pcre2_jit_compile(regex, PCRE2_JIT_COMPLETE) < 0)
+            {
+                MXS_NOTICE("PCRE2 JIT compilation of pattern '%s' failed, "
+                           "falling back to normal compilation.", match.c_str());
+            }
+            RegexToServers regex_ser(match, regex);
+            if (regex_ser.add_servers(servers))
+            {
+                mapping.push_back(regex_ser);
+            }
+            else
+            {
+                // The servers string didn't seem to contain any servers
+                MXS_ERROR("Could not parse servers from string '%s'.", servers.c_str());
+                pcre2_code_free(regex);
+                error = true;
+            }
+        }
+        else
+        {
+            MXS_ERROR("Invalid PCRE2 regular expression '%s' (position '%zu').",
+                      match.c_str(), error_offset);
+            MXS_PCRE2_PRINT_ERROR(errorcode);
+            error = true;
+        }
+    }
+
+    if (error)
+    {
+        for (unsigned int i = 0; i < mapping.size(); i++)
+        {
+            pcre2_code_free(mapping.at(i).m_regex);
+        }
+        mapping.clear();
+    }
 }
 
 /**
@@ -637,17 +799,6 @@ static REGEXHINT_SOURCE_HOST *set_source_address(const char *input_host)
 }
 
 /**
- * Free allocated memory
- *
- * @param instance    The filter instance
- */
-static void free_instance(RegexHintInst *instance)
-{
-    MXS_EXCEPTION_GUARD(delete instance);
-}
-
-
-/**
  * The module entry point routine. It is this routine that
  * must populate the structure that is referred to as the
  * "module object", this is a structure with the set of
@@ -669,7 +820,7 @@ extern "C" MXS_MODULE* MXS_CREATE_MODULE()
         NULL, // No clientReply
         diagnostic,
         getCapabilities,
-        NULL, // No destroyInstance
+        free_instance, // No destroyInstance
     };
 
     static MXS_MODULE info =
@@ -685,10 +836,9 @@ extern "C" MXS_MODULE* MXS_CREATE_MODULE()
         NULL, /* Thread init. */
         NULL, /* Thread finish. */
         {
-            {"match", MXS_MODULE_PARAM_STRING, NULL, MXS_MODULE_OPT_REQUIRED},
-            {"server", MXS_MODULE_PARAM_SERVER, NULL, MXS_MODULE_OPT_REQUIRED},
             {"source", MXS_MODULE_PARAM_STRING},
             {"user", MXS_MODULE_PARAM_STRING},
+            {"ovector_size", MXS_MODULE_PARAM_INT, "1"},
             {
                 "options",
                 MXS_MODULE_PARAM_ENUM,
@@ -700,5 +850,77 @@ extern "C" MXS_MODULE* MXS_CREATE_MODULE()
         }
     };
 
+    /* This module takes parameters of the form match, match01, match02, ... matchN
+     * and server, server01, server02, ... serverN. The total number of module
+     * parameters is limited, so let's limit the number of matches and servers.
+     * First, loop over the already defined parameters... */
+    int params_counter = 0;
+    while (info.parameters[params_counter].name != MXS_END_MODULE_PARAMS)
+    {
+        params_counter++;
+    }
+
+    /* Calculate how many pairs can be added. 100 is max (to keep the postfix
+     * number within two decimals). */
+    const int max_pairs = 100;
+    int match_server_pairs = ((MXS_MODULE_PARAM_MAX - params_counter) / 2);
+    if (match_server_pairs > max_pairs)
+    {
+        match_server_pairs = max_pairs;
+    }
+    /* Create parameter pair names */
+    generate_param_names(match_server_pairs);
+
+
+    /* Now make the actual parameters for the module struct */
+    MXS_MODULE_PARAM new_param = {NULL, MXS_MODULE_PARAM_STRING, NULL};
+    for (unsigned int i = 0; i < param_names_match.size(); i++)
+    {
+        new_param.name = param_names_match.at(i).c_str();
+        info.parameters[params_counter] = new_param;
+        params_counter++;
+        new_param.name = param_names_server.at(i).c_str();
+        info.parameters[params_counter] = new_param;
+        params_counter++;
+    }
+
+    info.parameters[params_counter].name = MXS_END_MODULE_PARAMS;
+
     return &info;
+}
+
+/* Generate N pairs of parameter names of form matchXX and serverXX
+ *
+ * @param pairs The number of parameter pairs to generate
+ */
+static void generate_param_names(int pairs)
+{
+    const char MATCH[] = "match";
+    const char SERVER[] = "server";
+    const int namelen_match = sizeof(MATCH) + 2;
+    const int namelen_server = sizeof(SERVER) + 2;
+
+    char name_match[namelen_match];
+    char name_server[namelen_server];
+
+    /* First, create the old "match" and "server" parameters for backwards
+     * compatibility. */
+    if (pairs > 0)
+    {
+        param_names_match.push_back(MATCH);
+        param_names_server.push_back(SERVER);
+    }
+    /* Then all the rest. */
+    const char FORMAT[] = "%s%02d";
+    for (int counter = 1; counter < pairs; counter++)
+    {
+        ss_debug(int rval = ) snprintf(name_match, namelen_match, FORMAT, MATCH, counter);
+        ss_dassert(rval == namelen_match - 1);
+        ss_debug(rval = ) snprintf(name_server, namelen_server, FORMAT, SERVER, counter);
+        ss_dassert(rval == namelen_server - 1);
+
+        // Have both names, add them to the global vectors
+        param_names_match.push_back(name_match);
+        param_names_server.push_back(name_server);
+    }
 }
